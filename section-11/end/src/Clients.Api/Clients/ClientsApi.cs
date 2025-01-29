@@ -1,0 +1,107 @@
+using System.Diagnostics;
+using System.Text.Json;
+using Clients.Api.Clients.Risk;
+using Clients.Api.Diagnostics;
+using Clients.Api.Diagnostics.Extensions;
+using Clients.Contracts.Events;
+using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Distributed;
+using OpenTelemetry;
+
+namespace Clients.Api.Clients;
+
+internal static class ClientsApi
+{
+    public static RouteGroupBuilder MapClients(this IEndpointRouteBuilder routes)
+    {
+        var group = routes.MapGroup("/clients");
+
+        group.WithTags("Clients");
+
+        group.MapGet("/", async (ClientsDbContext db) => await db.Clients
+            .Select(c => c.AsClientListItem()).AsNoTracking().ToListAsync());
+
+        group.MapGet("/{id:guid}", async (ClientsDbContext db, IDistributedCache cache, Guid id) =>
+        {
+            var cacheKey = $"client-{id}";
+            var clientJson = await cache.GetStringAsync(cacheKey);
+
+            if (!string.IsNullOrEmpty(clientJson))
+            {
+                return Results.Ok(JsonSerializer.Deserialize<Client>(clientJson));
+            }
+
+            var client = await db.Clients.FindAsync(id);
+            if (client == null)
+            {
+                return Results.NotFound();
+            }
+
+            clientJson = JsonSerializer.Serialize(client);
+            await cache.SetStringAsync(cacheKey, clientJson, new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+            });
+
+            return Results.Ok(client);
+        });
+
+        group.MapPost("/",
+            async Task<Results<Created<Client>, BadRequest<string>, Conflict<string>>> (
+                IRiskValidator riskValidator,
+                ClientsDbContext db,
+                EventsPublisher eventsPublisher,
+                Client newClient) =>
+            {
+                // DEMO - Risk of Context Propagation
+                // DEMO - don't set baggage with sensitive data
+                // Baggage.SetBaggage("client.email", newClient.Email);
+                // var httpClient = new HttpClient();
+                // var response = await httpClient.GetAsync("http://github.com/test");
+
+                if (string.IsNullOrWhiteSpace(newClient.Name))
+                    return TypedResults.BadRequest("Name is required.");
+
+                if (string.IsNullOrWhiteSpace(newClient.Email))
+                    return TypedResults.BadRequest("Email is required.");
+
+                if (await IsDuplicatedEmailAsync(db, newClient))
+                    return TypedResults.Conflict("A client with the same email already exists.");
+
+                var client = new Client
+                {
+                    Name = newClient.Name,
+                    Email = newClient.Email,
+                    Membership = newClient.Membership,
+                    Addresses = newClient.Addresses
+                };
+
+                Activity.Current.EnrichWithClient(client);
+                Baggage.SetBaggage("client.id", client.Id.ToString());
+
+                if (!await riskValidator.HasAcceptableRiskLevelAsync(newClient))
+                    return TypedResults.BadRequest("The request cannot be processed. Please contact support.");
+
+                db.Clients.Add(client);
+                await db.SaveChangesAsync();
+
+                // More about using Exemplars in .NET here:
+                // https://github.com/open-telemetry/opentelemetry-dotnet/blob/main/docs/metrics/exemplars/README.md
+                ApplicationDiagnostics.ClientsCreatedCounter.Add(1,
+                    new[] { new KeyValuePair<string, object?>("clients.membership", newClient.Membership.ToString()) });
+
+                eventsPublisher.Publish(client);
+
+                return TypedResults.Created($"/clients/{client.Id}", client);
+            });
+
+        return group;
+    }
+
+
+    private static async Task<bool> IsDuplicatedEmailAsync(ClientsDbContext db, Client newClient)
+    {
+        return await db.Clients.AnyAsync(c => c.Email == newClient.Email);
+    }
+}

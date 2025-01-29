@@ -1,0 +1,62 @@
+extensions:
+  health_check:
+  zpages:
+    endpoint: :55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:  
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 50
+    spike_limit_percentage: 30
+  
+  batch:
+    
+  attributes:
+    actions:
+      - key: region
+        value: west
+        action: insert
+
+exporters:
+  debug:
+  otlp/jaeger:
+    endpoint: "${JAEGER_ENDPOINT}"
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers:
+        - otlp
+      processors: [memory_limiter, attributes, batch]
+      exporters:
+        - debug
+        - otlp/jaeger
+    metrics:
+      receivers:
+        - otlp
+      processors: [memory_limiter, batch]
+      exporters:
+        - debug
+        - prometheus
+    logs:
+      receivers: [otlp]
+      processors: []
+      exporters: [loki, debug]
+
+  extensions:
+    - health_check
+    - zpages
